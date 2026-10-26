@@ -29,6 +29,62 @@ String WIFI_HOSTNAME = "k2.local";
 String PRINTER_HOSTNAME = "";
 bool encrypted = false;
 
+String currentStatusState = "ready";
+String currentStatusMessage = "Bereit – RFID-Tag auflegen.";
+bool currentStatusHasTag = false;
+bool currentStatusWriting = false;
+bool currentStatusSuccess = false;
+
+String jsonEscape(String value) {
+  String out;
+  out.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char hex[7];
+          snprintf(hex, sizeof(hex), "\\u%04x", (unsigned char)c);
+          out += hex;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+String buildStatusJson(const String &state, const String &message, bool hasTag, bool writing, bool success) {
+  String json = "{\"state\":\"";
+  json += jsonEscape(state);
+  json += "\",\"message\":\"";
+  json += jsonEscape(message);
+  json += "\",\"tagPresent\":";
+  json += hasTag ? "true" : "false";
+  json += ",\"writing\":";
+  json += writing ? "true" : "false";
+  json += ",\"success\":";
+  json += success ? "true" : "false";
+  json += "}";
+  return json;
+}
+
+void setStatus(const String &state, const String &message, bool hasTag, bool writing, bool success) {
+  currentStatusState = state;
+  currentStatusMessage = message;
+  currentStatusHasTag = hasTag;
+  currentStatusWriting = writing;
+  currentStatusSuccess = success;
+}
+
 void setup()
 {
   LittleFS.begin();
@@ -37,14 +93,15 @@ void setup()
   mfrc522.PCD_Init();
   key = {255, 255, 255, 255, 255, 255};
   pinMode(SPK_PIN, OUTPUT);
+
   if (AP_SSID == "" || AP_PASS == "")
   {
     AP_SSID = "K2_RFID";
     AP_PASS = "password";
   }
+
   WiFi.softAPConfig(Server_IP, Server_IP, Subnet_Mask);
   WiFi.softAP(AP_SSID.c_str(), AP_PASS.c_str());
-  WiFi.softAPConfig(Server_IP, Server_IP, Subnet_Mask);
 
   if (WIFI_SSID != "" && WIFI_PASS != "")
   {
@@ -52,11 +109,9 @@ void setup()
     WiFi.setAutoReconnect(true);
     WiFi.hostname(WIFI_HOSTNAME);
     WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
-    if (WiFi.waitForConnectResult() == WL_CONNECTED)
-    {
-      IPAddress LAN_IP = WiFi.localIP();
-    }
+    WiFi.waitForConnectResult();
   }
+
   if (WIFI_HOSTNAME != "")
   {
     String mdnsHost = WIFI_HOSTNAME;
@@ -64,12 +119,17 @@ void setup()
     MDNS.begin(mdnsHost.c_str());
   }
 
+  webServer.on("/status", HTTP_GET, []() {
+    webServer.send(200, "application/json", buildStatusJson(currentStatusState, currentStatusMessage, currentStatusHasTag, currentStatusWriting, currentStatusSuccess));
+  });
+
   webServer.on("/config", HTTP_GET, handleConfig);
   webServer.on("/index.html", HTTP_GET, handleIndex);
   webServer.on("/", HTTP_GET, handleIndex);
   webServer.on("/material_database.json", HTTP_GET, handleDb);
   webServer.on("/config", HTTP_POST, handleConfigP);
   webServer.on("/spooldata", HTTP_POST, handleSpoolData);
+
   webServer.on("/update.html", HTTP_POST, []() {
     webServer.send(200, "text/plain", upMsg);
     delay(1000);
@@ -84,6 +144,7 @@ void setup()
   }, []() {
     handleDbUpdate();
   });
+
   webServer.onNotFound(handle404);
   webServer.begin(80);
 }
@@ -91,17 +152,29 @@ void setup()
 void loop()
 {
   webServer.handleClient();
+
   if (!mfrc522.PICC_IsNewCardPresent())
+  {
+    if (currentStatusState != "ready" || currentStatusMessage != "Bereit – RFID-Tag auflegen.")
+    {
+      setStatus("ready", "Bereit – RFID-Tag auflegen.", false, false, false);
+    }
     return;
+  }
 
   if (!mfrc522.PICC_ReadCardSerial())
+  {
+    setStatus("error", "Tag erkannt, aber die UID konnte nicht gelesen werden.", true, false, false);
     return;
+  }
 
+  setStatus("tag_detected", "Tag erkannt. Prüfe Kartentyp und Schlüssel...", true, false, false);
   encrypted = false;
 
   MFRC522::PICC_Type piccType = mfrc522.PICC_GetType(mfrc522.uid.sak);
   if (piccType != MFRC522::PICC_TYPE_MIFARE_MINI && piccType != MFRC522::PICC_TYPE_MIFARE_1K && piccType != MFRC522::PICC_TYPE_MIFARE_4K)
   {
+    setStatus("error", "Nicht unterstützter Tagtyp. Nur MIFARE Classic 1K/4K/mini werden unterstützt.", true, false, false);
     tone(SPK_PIN, 400, 400);
     delay(2000);
     return;
@@ -110,16 +183,24 @@ void loop()
   createKey();
 
   MFRC522::StatusCode status;
+  setStatus("checking_key", "Schlüsselprüfung läuft...", true, false, false);
   status = (MFRC522::StatusCode)mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 7, &key, &(mfrc522.uid));
   if (status != MFRC522::STATUS_OK)
   {
     if (!mfrc522.PICC_IsNewCardPresent())
+    {
+      setStatus("ready", "Bereit – RFID-Tag auflegen.", false, false, false);
       return;
+    }
     if (!mfrc522.PICC_ReadCardSerial())
+    {
+      setStatus("error", "Tag nach Authentifizierungsfehler nicht erneut lesbar.", true, false, false);
       return;
+    }
     status = (MFRC522::StatusCode)mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, 7, &ekey, &(mfrc522.uid));
     if (status != MFRC522::STATUS_OK)
     {
+      setStatus("error", "Authentifizierung fehlgeschlagen. Timeout, falscher Schlüssel oder Kommunikationsproblem.", true, false, false);
       tone(SPK_PIN, 400, 150);
       delay(300);
       tone(SPK_PIN, 400, 150);
@@ -128,6 +209,8 @@ void loop()
     }
     encrypted = true;
   }
+
+  setStatus("writing", "Spool-Daten werden auf den Tag geschrieben...", true, true, false);
 
   byte blockData[17];
   byte encData[16];
@@ -138,7 +221,16 @@ void loop()
     if (blockID >= 4 && blockID < 7)
     {
       aes.encrypt(1, blockData, encData);
-      mfrc522.MIFARE_Write(blockID, encData, 16);
+      status = (MFRC522::StatusCode)mfrc522.MIFARE_Write(blockID, encData, 16);
+      if (status != MFRC522::STATUS_OK)
+      {
+        setStatus("error", "Schreiben in Block " + String(blockID) + " fehlgeschlagen.", true, false, false);
+        tone(SPK_PIN, 300, 250);
+        delay(1500);
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+        return;
+      }
     }
     blockID++;
   }
@@ -149,6 +241,13 @@ void loop()
     byte byteCount = sizeof(buffer);
     byte block = 7;
     status = mfrc522.MIFARE_Read(block, buffer, &byteCount);
+    if (status != MFRC522::STATUS_OK)
+    {
+      setStatus("error", "Sektor-Trailer konnte nicht gelesen werden.", true, false, false);
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
+    }
     int y = 0;
     for (int i = 10; i < 16; i++)
     {
@@ -159,9 +258,17 @@ void loop()
     {
       buffer[i] = ekey.keyByte[i];
     }
-    mfrc522.MIFARE_Write(7, buffer, 16);
+    status = mfrc522.MIFARE_Write(7, buffer, 16);
+    if (status != MFRC522::STATUS_OK)
+    {
+      setStatus("error", "Schreiben des Sektor-Trailers fehlgeschlagen.", true, false, false);
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+      return;
+    }
   }
 
+  setStatus("success", "Erfolgreich beschrieben. Tag kann entfernt werden.", true, false, true);
   mfrc522.PICC_HaltA();
   mfrc522.PCD_StopCrypto1();
   tone(SPK_PIN, 1000, 200);
@@ -342,7 +449,7 @@ void updateFw()
             updateFile.read((uint8_t *)ibuffer, 1);
             Update.write(ibuffer, sizeof(ibuffer));
             bsent++;
-            int progr = ((double)bsent /  updateSize) * 100;
+            int progr = ((double)bsent / updateSize) * 100;
             if (progr >= cprog) {
               cprog = progr + 10;
             }
@@ -383,11 +490,11 @@ void handleSpoolData()
   {
     String materialColor = webServer.arg("materialColor");
     materialColor.replace("#", "");
-    String filamentId = "1" + webServer.arg("materialType"); // material_database.json
-    String vendorId = "0276";                                               // 0276 creality
+    String filamentId = "1" + webServer.arg("materialType");
+    String vendorId = "0276";
     String color = "0" + materialColor;
     String filamentLen = GetMaterialLength(webServer.arg("materialWeight"));
-    String serialNum = String(random(100000, 999999)); // 000001
+    String serialNum = String(random(100000, 999999));
     String reserve = "000000";
     spoolData = "AB124" + vendorId + "A2" + filamentId + color + filamentLen + serialNum + reserve + "00000000";
     File file = LittleFS.open("/spool.ini", "w");
@@ -396,6 +503,7 @@ void handleSpoolData()
       file.print(spoolData);
       file.close();
     }
+    setStatus("ready", "Spool-Daten lokal gespeichert. RFID-Tag kann jetzt beschrieben werden.", false, false, false);
     String htmStr = "OK";
     webServer.setContentLength(htmStr.length());
     webServer.send(200, "text/plain", htmStr);
@@ -505,7 +613,6 @@ void loadConfig()
         PRINTER_HOSTNAME = split(iniData, "PRINTER_HOST=", "\r\n");
         PRINTER_HOSTNAME.trim();
       }
-      
     }
   }
   else
